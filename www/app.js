@@ -45,6 +45,10 @@ const BOOTSTRAP_CACHE_KEY = "ticketops-bootstrap-cache-v5";
 const BROWSER_DB_STORAGE_KEY = "ticketops-browser-db-v3";
 const BOOTSTRAP_CACHE_TTL_MS = 10 * 60 * 1000;
 const APPS_SCRIPT_BOOTSTRAP_CACHE_TTL_MS = 60 * 1000;
+// Enter the app instantly from a cached bootstrap up to this old, then refresh
+// in the background — login never has to wait for the slow Apps Script call.
+const BOOTSTRAP_SWR_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+const BOOTSTRAP_TIMEOUT_MS = 90000;
 const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_TICKET_PHOTOS = 5;
 const GOOGLE_SHEETS_MAX_TICKET_PHOTOS = 2;
@@ -556,6 +560,88 @@ function closePhotoLightbox() {
   if (!overlay) return;
   overlay.hidden = true;
   document.body.classList.remove("photo-lightbox-open");
+}
+
+// The slim bootstrap ships photo COUNTS (photoCount/evidencePhotoCount plus a
+// photosOmitted flag) instead of embedded base64 blobs; full photos load on
+// demand from /api/tickets/:id/photos and /api/tasks/:id/photos. Backends that
+// still embed photos keep working — inline data wins whenever it is present.
+const photoBundleCache = new Map();
+
+function fetchPhotoBundle(kind, id) {
+  const key = `${kind}:${id}`;
+  if (!photoBundleCache.has(key)) {
+    const request = api(`/api/${kind}s/${encodeURIComponent(id)}/photos`, { method: "GET" })
+      .catch((error) => {
+        photoBundleCache.delete(key);
+        throw error;
+      });
+    photoBundleCache.set(key, request);
+  }
+  return photoBundleCache.get(key);
+}
+
+function inlineTicketIssuePhotos(ticket) {
+  return (ticket?.photoUrls?.length ? ticket.photoUrls : [ticket?.photoUrl]).filter(Boolean);
+}
+
+function inlineTicketResolutionPhotos(ticket) {
+  const urls = ticket?.resolutionPhotoUrls?.length ? ticket.resolutionPhotoUrls : ticket?.evidencePhotoUrls;
+  return (urls || []).filter(Boolean);
+}
+
+function ticketIssuePhotoCount(ticket) {
+  return inlineTicketIssuePhotos(ticket).length
+    || (ticket?.photosOmitted ? Number(ticket.photoCount || 0) : 0);
+}
+
+function ticketResolutionPhotoCount(ticket) {
+  return inlineTicketResolutionPhotos(ticket).length
+    || (ticket?.photosOmitted ? (Number(ticket.resolutionPhotoCount || 0) || Number(ticket.evidencePhotoCount || 0)) : 0);
+}
+
+function inlineTaskEvidencePhotos(task) {
+  return [...new Set([task?.evidencePhotoUrl || task?.photoUrl, ...(task?.photoUrls || [])].filter(Boolean))];
+}
+
+function taskEvidencePhotoCount(task) {
+  return inlineTaskEvidencePhotos(task).length
+    || (task?.photosOmitted ? (Number(task.evidencePhotoCount || 0) || Number(task.photoCount || 0)) : 0);
+}
+
+async function ticketPhotoSets(ticket) {
+  const inlineIssue = inlineTicketIssuePhotos(ticket);
+  const inlineResolution = inlineTicketResolutionPhotos(ticket);
+  if (!ticket?.photosOmitted) return { issue: inlineIssue, resolution: inlineResolution };
+  const needIssue = inlineIssue.length < Number(ticket.photoCount || 0);
+  const needResolution = inlineResolution.length < ticketResolutionPhotoCount(ticket);
+  if (!needIssue && !needResolution) return { issue: inlineIssue, resolution: inlineResolution };
+  const bundle = await fetchPhotoBundle("ticket", ticket.id);
+  const issue = (bundle.photoUrls?.length ? bundle.photoUrls : [bundle.photoUrl]).filter(Boolean);
+  const resolution = (bundle.resolutionPhotoUrls?.length ? bundle.resolutionPhotoUrls : bundle.evidencePhotoUrls || []).filter(Boolean);
+  return {
+    issue: issue.length ? issue : inlineIssue,
+    resolution: resolution.length ? resolution : inlineResolution
+  };
+}
+
+async function taskEvidencePhotoList(task) {
+  const inline = inlineTaskEvidencePhotos(task);
+  if (inline.length || !task?.photosOmitted || !taskEvidencePhotoCount(task)) return inline;
+  const bundle = await fetchPhotoBundle("task", task.id);
+  return [...new Set([bundle.evidencePhotoUrl || bundle.photoUrl, ...(bundle.photoUrls || [])].filter(Boolean))];
+}
+
+async function openLazyPhotoLightbox(title, loadPhotos) {
+  const slowTimer = setTimeout(() => showToast("Loading photos from the live backend…", "info", 2500), 400);
+  try {
+    const photos = await loadPhotos();
+    openPhotoLightbox(title, photos);
+  } catch (error) {
+    showToast(`Could not load photos: ${error.message}`, "error");
+  } finally {
+    clearTimeout(slowTimer);
+  }
 }
 
 let currentUser = readStoredUser();
@@ -1146,7 +1232,7 @@ function scheduledTaskRows(tasks, { allowActions = false } = {}) {
     const category = taskCategoryLabel(task);
     const assignedBy = taskAssignedByLabel(task);
     const needsEvidence = taskRequiresEvidence(task);
-    const evidencePhoto = task.evidencePhotoUrl || task.photoUrl || "";
+    const evidencePhotoCount = taskEvidencePhotoCount(task);
     return `
       <article class="task-row status-${token(task.status)} ${needsEvidence && task.status !== "Done" ? "requires-evidence" : ""}">
         <div class="task-main">
@@ -1163,7 +1249,7 @@ function scheduledTaskRows(tasks, { allowActions = false } = {}) {
           </div>
         </div>
         <div class="task-actions">
-          ${evidencePhoto ? `<button type="button" class="small-button" data-task-photo="${escapeHtml(task.id)}">Evidence</button>` : ""}
+          ${evidencePhotoCount ? `<button type="button" class="small-button" data-task-photo="${escapeHtml(task.id)}">Evidence</button>` : ""}
           ${allowActions && task.status !== "Done" ? `<button type="button" class="small-button success task-done-button" data-task-done="${escapeHtml(task.id)}">Done</button>` : ""}
           ${allowActions && task.status !== "Done" ? `<button type="button" class="small-button warning" data-task-not-done="${escapeHtml(task.id)}">Not Done</button>` : ""}
         </div>
@@ -1464,20 +1550,22 @@ function userOutletLabel(user) {
   return outlets.length ? outlets.join(", ") : "No outlet access";
 }
 
+function invalidateCachesAfterWrite(options = {}) {
+  if (String(options.method || "GET").toUpperCase() === "GET") return;
+  localStorage.removeItem(bootstrapCacheKey());
+  photoBundleCache.clear();
+}
+
 async function api(path, options = {}) {
   if (USE_BROWSER_FALLBACK_API) {
     const result = await browserFallbackApi(path, options);
-    if (String(options.method || "GET").toUpperCase() !== "GET") {
-      localStorage.removeItem(bootstrapCacheKey());
-    }
+    invalidateCachesAfterWrite(options);
     return result;
   }
 
   if (USE_APPS_SCRIPT_API) {
     const result = await appsScriptApi(path, options);
-    if (String(options.method || "GET").toUpperCase() !== "GET") {
-      localStorage.removeItem(bootstrapCacheKey());
-    }
+    invalidateCachesAfterWrite(options);
     return result;
   }
 
@@ -1493,9 +1581,7 @@ async function api(path, options = {}) {
     const error = await response.json().catch(() => ({ error: "Request failed" }));
     throw new Error(error.error || "Request failed");
   }
-  if (String(options.method || "GET").toUpperCase() !== "GET") {
-    localStorage.removeItem(bootstrapCacheKey());
-  }
+  invalidateCachesAfterWrite(options);
   return response.json();
 }
 
@@ -2112,7 +2198,7 @@ async function appsScriptApi(path, options = {}) {
 
   const isRead = method === "GET";
   const maxAttempts = isRead ? 4 : 1;
-  const timeoutMs = 25000;
+  const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 25000;
   let lastError = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -2216,6 +2302,7 @@ async function fetchBootstrapState({ preferCache = true } = {}) {
     try {
       const nextState = normalizeBootstrapState(await appsScriptApi("/api/bootstrap", {
         method: "GET",
+        timeoutMs: BOOTSTRAP_TIMEOUT_MS,
         headers: cached?.etag ? { "If-None-Match": cached.etag } : {}
       }));
       if (!hasOperationalData(nextState)) {
@@ -2347,6 +2434,29 @@ async function enterApp() {
       ? savedView
       : roleHomeView();
   setAppLoading(true);
+
+  // Stale-while-revalidate: with a recent-enough cached bootstrap, show the app
+  // immediately and refresh from the live backend in the background, so login
+  // never waits on the slow Apps Script call.
+  const cachedBootstrap = LOCAL_DATA_MODE ? null : readBootstrapCache();
+  const cacheAgeMs = cachedBootstrap ? Date.now() - Number(cachedBootstrap.at || 0) : Infinity;
+  if (cachedBootstrap?.state && hasOperationalData(cachedBootstrap.state) && cacheAgeMs < BOOTSTRAP_SWR_MAX_AGE_MS) {
+    state = normalizeBootstrapState(cachedBootstrap.state);
+    rebuildStateIndex();
+    renderSelects();
+    render();
+    updateLiveIntel();
+    document.querySelector("#appShell").classList.remove("is-hidden");
+    switchView(document.body.dataset.view);
+    markUserActivity();
+    setAppLoading(false);
+    loadState({ silent: true, forceNetwork: cacheAgeMs > APPS_SCRIPT_BOOTSTRAP_CACHE_TTL_MS }).catch((error) => {
+      console.warn("Background bootstrap refresh failed", error);
+      showToast("Live refresh failed — showing last synced data.", "warning", 6000);
+    });
+    return;
+  }
+
   try {
     await loadState({ silent: false });
     document.querySelector("#appShell").classList.remove("is-hidden");
@@ -2445,7 +2555,7 @@ function requestDeferredViewData(viewName = activeRouteView()) {
   }
 }
 
-async function loadState({ silent = true } = {}) {
+async function loadState({ silent = true, forceNetwork = false } = {}) {
   if (!currentUser) return;
   const syncEl = document.querySelector("#syncStatus");
   if (!silent) {
@@ -2458,7 +2568,7 @@ async function loadState({ silent = true } = {}) {
   const scrollY = silent ? window.scrollY : null;
   const focusToken = silent ? captureActiveField() : null;
   try {
-    state = normalizeBootstrapState(await fetchBootstrapState());
+    state = normalizeBootstrapState(await fetchBootstrapState({ preferCache: !forceNetwork }));
     rebuildStateIndex();
     const viewName = activeRouteView();
     if (viewNeedsStitchStatus(viewName)) await ensureStitchStatus();
@@ -4348,8 +4458,10 @@ function ticketCard(ticket, mode) {
   const actions = renderActionButtons(ticket, mode, canVerify, canWork);
   const dispatchReason = suggested?.dispatchReason || (assigned ? `Assigned to ${assigned.name}` : "");
   const nextAction = mode === "admin" ? ticketNextAction(ticket, assigned, suggested) : "";
-  const photoUrls = (ticket.photoUrls?.length ? ticket.photoUrls : [ticket.photoUrl]).filter(Boolean);
-  const resolutionPhotoUrls = (ticket.resolutionPhotoUrls || []).filter(Boolean);
+  const photoUrls = inlineTicketIssuePhotos(ticket);
+  const issuePhotoCount = ticketIssuePhotoCount(ticket);
+  const resolutionPhotoUrls = inlineTicketResolutionPhotos(ticket);
+  const resolutionCount = ticketResolutionPhotoCount(ticket);
   const workflowSteps = ticketWorkflowSteps(ticket);
 
   return `
@@ -4379,22 +4491,22 @@ function ticketCard(ticket, mode) {
         <span class="badge">${escapeHtml(assigned ? assigned.name : "Unassigned")}</span>
         ${ticket.scheduledAt ? `<span class="badge">Dispatch ${escapeHtml(formatDateTime(ticket.scheduledAt))}</span>` : ""}
         ${Number(ticket.closePrice || 0) > 0 ? `<span class="badge status-closed">Close ${escapeHtml(formatClosePrice(ticket.closePrice))}</span>` : ""}
-        ${photoUrls.length ? `<span class="badge photo-badge">${photoUrls.length} Photo${photoUrls.length === 1 ? "" : "s"}</span>` : ""}
-        ${resolutionPhotoUrls.length ? `<span class="badge status-closed">Completion Photo</span>` : ""}
+        ${issuePhotoCount ? `<span class="badge photo-badge">${issuePhotoCount} Photo${issuePhotoCount === 1 ? "" : "s"}</span>` : ""}
+        ${resolutionCount ? `<span class="badge status-closed">Completion Photo</span>` : ""}
         ${suggested ? `<span class="badge confidence">Score ${escapeHtml(suggested.dispatchScore || "OK")}: ${escapeHtml(suggested.name)}</span>` : ""}
         ${selectedSummary?.risk.length ? `<span class="badge status-blocked">Override risk: ${escapeHtml(selectedSummary.risk.join(", "))}</span>` : ""}
       </div>
       ${nextAction ? `<p class="ticket-meta next-action">Next: ${escapeHtml(nextAction)}</p>` : ""}
-      ${photoUrls.length ? `
+      ${issuePhotoCount ? `
         <button class="ticket-photo" type="button" data-photo-open="${escapeHtml(ticket.id)}" aria-label="Open issue photo for ${escapeHtml(ticket.id)}">
-          <img src="${escapeHtml(photoUrls[0])}" alt="Issue photo for ${escapeHtml(ticket.id)}">
-          <span>${photoUrls.length} issue photo${photoUrls.length === 1 ? "" : "s"} attached</span>
+          ${photoUrls.length ? `<img src="${escapeHtml(photoUrls[0])}" alt="Issue photo for ${escapeHtml(ticket.id)}">` : `<span class="ticket-photo-placeholder" aria-hidden="true">📷</span>`}
+          <span>${issuePhotoCount} issue photo${issuePhotoCount === 1 ? "" : "s"} attached${photoUrls.length ? "" : " — tap to view"}</span>
         </button>
       ` : ""}
-      ${resolutionPhotoUrls.length ? `
+      ${resolutionCount ? `
         <button class="ticket-photo completion-photo" type="button" data-resolution-photo-open="${escapeHtml(ticket.id)}" aria-label="Open completion photo for ${escapeHtml(ticket.id)}">
-          <img src="${escapeHtml(resolutionPhotoUrls[0])}" alt="Completion photo for ${escapeHtml(ticket.id)}">
-          <span>${resolutionPhotoUrls.length} completion photo${resolutionPhotoUrls.length === 1 ? "" : "s"} attached</span>
+          ${resolutionPhotoUrls.length ? `<img src="${escapeHtml(resolutionPhotoUrls[0])}" alt="Completion photo for ${escapeHtml(ticket.id)}">` : `<span class="ticket-photo-placeholder" aria-hidden="true">📷</span>`}
+          <span>${resolutionCount} completion photo${resolutionCount === 1 ? "" : "s"} attached${resolutionPhotoUrls.length ? "" : " — tap to view"}</span>
         </button>
       ` : ""}
       ${dispatchReason ? `<p class="ticket-meta dispatch-confidence">Dispatch: ${escapeHtml(dispatchReason)}</p>` : ""}
@@ -5504,7 +5616,7 @@ function openAssetDetail(assetId) {
   const today = todayInputValue();
   const todayTasks = assetTasks.filter((task) => task.date === today);
   const doneTasks = todayTasks.filter((task) => task.status === "Done");
-  const photos = assetTickets.filter((ticket) => ticket.photoUrl);
+  const photos = assetTickets.filter((ticket) => ticketIssuePhotoCount(ticket) > 0);
   const technicians = assetCurrentTechnicians(asset.id);
   const historyItems = [
     ...assetTasks
@@ -5546,7 +5658,7 @@ function openAssetDetail(assetId) {
             <article class="asset-mini-row priority-${token(ticket.priority)}">
               <strong>${escapeHtml(ticket.id)} ${escapeHtml(ticket.note)}</strong>
               <span>${escapeHtml(ticket.status)} / ${escapeHtml(technicianById(ticket.assignedTo)?.name || "Unassigned")} / ${escapeHtml(PRIORITY_LABELS[ticket.priority] || ticket.priority)}</span>
-              ${ticket.photoUrl ? `<button type="button" class="small-button" data-photo-open="${escapeHtml(ticket.id)}">Open Photo</button>` : ""}
+              ${ticketIssuePhotoCount(ticket) ? `<button type="button" class="small-button" data-photo-open="${escapeHtml(ticket.id)}">Open Photo</button>` : ""}
             </article>
           `).join("") : `<div class="empty mini">No open issue ticket for this asset.</div>`}
         </div>
@@ -5561,9 +5673,9 @@ function openAssetDetail(assetId) {
           ${todayTasks.length ? todayTasks.map((task) => `
             <article class="asset-mini-row status-${token(task.status)}">
               <strong>${escapeHtml(task.title.replace(`${taskPhase(task.title)}: `, ""))}</strong>
-              <span>${escapeHtml(task.status)} / ${escapeHtml(technicianById(task.assignedTo)?.name || "Technician")}${task.evidencePhotoUrl || task.evidenceComment ? " / evidence attached" : taskRequiresEvidence(task) ? " / photo required" : ""}</span>
+              <span>${escapeHtml(task.status)} / ${escapeHtml(technicianById(task.assignedTo)?.name || "Technician")}${taskEvidencePhotoCount(task) || task.evidenceComment ? " / evidence attached" : taskRequiresEvidence(task) ? " / photo required" : ""}</span>
               ${task.status === "Not Done" && task.evidenceComment ? `<span>${escapeHtml(task.evidenceComment)}</span>` : ""}
-              ${task.evidencePhotoUrl ? `<button type="button" class="small-button" data-task-photo="${escapeHtml(task.id)}">Open Evidence</button>` : ""}
+              ${taskEvidencePhotoCount(task) ? `<button type="button" class="small-button" data-task-photo="${escapeHtml(task.id)}">Open Evidence</button>` : ""}
             </article>
           `).join("") : `<div class="empty mini">No checklist task for this asset today.</div>`}
         </div>
@@ -5691,7 +5803,7 @@ function renderClosedHistory() {
     })
     : closedTickets;
   const withCompletionPhotos = closedTickets.filter((ticket) => (ticket.resolutionPhotoUrls || []).length).length;
-  const withIssuePhotos = closedTickets.filter((ticket) => (ticket.photoUrls?.length ? ticket.photoUrls : [ticket.photoUrl]).filter(Boolean).length).length;
+  const withIssuePhotos = closedTickets.filter((ticket) => ticketIssuePhotoCount(ticket) > 0).length;
 
   document.querySelector("#historyTitle").textContent = currentUser?.role === "technician" ? "My Closed Jobs" : "Closed Ticket History";
   document.querySelector("#historyScope").textContent = historyScopeLabel();
@@ -7146,22 +7258,21 @@ document.addEventListener("click", async (event) => {
   const photoButton = event.target.closest?.("[data-photo-open]");
   if (photoButton) {
     const ticket = state.tickets.find((item) => item.id === photoButton.dataset.photoOpen);
-    const photos = (ticket?.photoUrls?.length ? ticket.photoUrls : [ticket?.photoUrl]).filter(Boolean);
-    openPhotoLightbox(`${ticket?.id || "Ticket"} — issue photos`, photos);
+    await openLazyPhotoLightbox(`${ticket?.id || "Ticket"} — issue photos`, async () => (await ticketPhotoSets(ticket)).issue);
     return;
   }
 
   const resolutionPhotoButton = event.target.closest?.("[data-resolution-photo-open]");
   if (resolutionPhotoButton) {
     const ticket = state.tickets.find((item) => item.id === resolutionPhotoButton.dataset.resolutionPhotoOpen);
-    openPhotoLightbox(`${ticket?.id || "Ticket"} — completion photos`, ticket?.resolutionPhotoUrls || []);
+    await openLazyPhotoLightbox(`${ticket?.id || "Ticket"} — completion photos`, async () => (await ticketPhotoSets(ticket)).resolution);
     return;
   }
 
   const taskPhotoButton = event.target.closest?.("[data-task-photo]");
   if (taskPhotoButton) {
     const task = (state.tasks || []).find((item) => item.id === taskPhotoButton.dataset.taskPhoto);
-    openPhotoLightbox(`${task?.id || "Task"} — evidence photo`, [task?.evidencePhotoUrl || task?.photoUrl]);
+    await openLazyPhotoLightbox(`${task?.id || "Task"} — evidence photo`, () => taskEvidencePhotoList(task));
     return;
   }
 
@@ -7169,12 +7280,11 @@ document.addEventListener("click", async (event) => {
   const ticketCardEl = event.target.closest?.(".ticket-card[data-ticket-id]");
   if (ticketCardEl && !event.target.closest("button, select, input, textarea, label, a")) {
     const ticket = (state.tickets || []).find((item) => item.id === ticketCardEl.dataset.ticketId);
-    const photos = [
-      ...(ticket?.photoUrls?.length ? ticket.photoUrls : [ticket?.photoUrl]),
-      ...(ticket?.resolutionPhotoUrls || [])
-    ].filter(Boolean);
-    if (photos.length) {
-      openPhotoLightbox(`${ticket.id} — photos`, photos);
+    if (ticketIssuePhotoCount(ticket) + ticketResolutionPhotoCount(ticket) > 0) {
+      await openLazyPhotoLightbox(`${ticket.id} — photos`, async () => {
+        const sets = await ticketPhotoSets(ticket);
+        return [...sets.issue, ...sets.resolution];
+      });
     } else {
       showToast(`${ticketCardEl.dataset.ticketId} has no photos attached yet.`, "info");
     }

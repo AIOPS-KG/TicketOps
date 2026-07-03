@@ -1254,6 +1254,7 @@ body[data-dashboard-mode="detail"] #dashboardSummaryGrid { display: none; }
   width: 100%;
 }
 .ticket-photo img { width: 46px; height: 46px; border-radius: 7px; object-fit: cover; flex-shrink: 0; }
+.ticket-photo .ticket-photo-placeholder { width: 46px; height: 46px; border-radius: 7px; background: var(--panel-border); display: flex; align-items: center; justify-content: center; font-size: 20px; flex-shrink: 0; }
 .ticket-photo span { font-size: 12px; color: var(--ink-soft); }
 .ticket-photo.completion-photo { border-color: color-mix(in srgb, var(--success) 35%, transparent); }
 

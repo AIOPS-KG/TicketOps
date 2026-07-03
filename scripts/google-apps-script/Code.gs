@@ -97,7 +97,9 @@ function handleRequest(envelope) {
   if (method === "GET" && path === "/api/auth/demo-users") return ok({ users: (db.users || []).map(publicUser) });
   if (method === "POST" && path === "/api/auth/change-password") return changePassword(db, user, body);
   if (method === "POST" && /^\/api\/admin\/users\/[^/]+\/reset-password$/.test(path)) return resetPassword(db, user, segment(path, 3), body);
-  if (method === "GET" && path === "/api/bootstrap") return requireLogin(user, () => { if (!db.__readOnlyFallback) refreshTodayTasks(db); return ok(withReports(scopedDbForUser(db, user), user)); });
+  if (method === "GET" && path === "/api/bootstrap") return requireLogin(user, () => { if (!db.__readOnlyFallback) refreshTodayTasks(db); return ok(bootstrapForUser(db, user)); });
+  if (method === "GET" && /^\/api\/tickets\/[^/]+\/photos$/.test(path)) return requireLoggedIn(user, () => ticketPhotos(db, user, segment(path, 2)));
+  if (method === "GET" && /^\/api\/tasks\/[^/]+\/photos$/.test(path)) return requireLoggedIn(user, () => taskPhotos(db, user, segment(path, 2)));
   if (method === "GET" && path === "/api/categories") return requireAdmin(user, () => ok(db.categories || []));
   if (method === "GET" && path === "/api/backups/drive/status") return requireAdmin(user, () => ok(driveBackupStatus()));
   if (method === "POST" && path === "/api/backups/drive/run") return requireAdmin(user, () => ok(createDriveBackup("manual")));
@@ -519,8 +521,11 @@ function requireRole(user, role, fn) {
   return user && user.role === role ? fn() : fail(403, role + " access only");
 }
 
+// Shallow scoping: filters build new arrays but share the item objects with db.
+// Nothing downstream mutates items in place (slimming and publicUser copy first),
+// which keeps bootstrap free of the old double JSON deep-copy of the whole DB.
 function scopedDbForUser(db, user) {
-  const copy = JSON.parse(JSON.stringify(db));
+  const copy = normalizeDb(Object.assign({}, db));
   if (!user) return copy;
   if (user.role === "manager") {
     const outlets = outletAccessForUser(user, db);
@@ -536,19 +541,113 @@ function scopedDbForUser(db, user) {
   return copy;
 }
 
+// Bootstrap ships photo COUNTS instead of base64 blobs; clients fetch full photos
+// on demand via /api/tickets/:id/photos and /api/tasks/:id/photos. Short http(s)
+// URLs stay inline — only heavy data: URIs are stripped.
+const PHOTO_INLINE_MAX_CHARS = 512;
+
+function heavyPhotoValue(value) {
+  const text = String(value || "");
+  return text.length > PHOTO_INLINE_MAX_CHARS || text.indexOf("data:") === 0;
+}
+
+function inlinePhotoCount(single, list) {
+  const urls = (Array.isArray(list) ? list : []).filter(Boolean);
+  return urls.length ? urls.length : (single ? 1 : 0);
+}
+
+function slimPhotoFields(item, pairs) {
+  const copy = Object.assign({}, item);
+  let omitted = false;
+  pairs.forEach((pair) => {
+    const singleKey = pair[0];
+    const listKey = pair[1];
+    const countKey = pair[2];
+    const single = singleKey ? copy[singleKey] : "";
+    const list = Array.isArray(copy[listKey]) ? copy[listKey] : [];
+    copy[countKey] = inlinePhotoCount(single, list);
+    if (list.some(heavyPhotoValue)) {
+      copy[listKey] = [];
+      omitted = true;
+    }
+    if (singleKey && heavyPhotoValue(single)) {
+      copy[singleKey] = "";
+      omitted = true;
+    }
+  });
+  if (omitted) copy.photosOmitted = true;
+  return copy;
+}
+
+function slimTicketForBootstrap(ticket) {
+  return slimPhotoFields(ticket, [
+    ["photoUrl", "photoUrls", "photoCount"],
+    ["evidencePhotoUrl", "evidencePhotoUrls", "evidencePhotoCount"],
+    ["", "resolutionPhotoUrls", "resolutionPhotoCount"]
+  ]);
+}
+
+function slimTaskForBootstrap(task) {
+  return slimPhotoFields(task, [
+    ["photoUrl", "photoUrls", "photoCount"],
+    ["evidencePhotoUrl", "evidencePhotoUrls", "evidencePhotoCount"]
+  ]);
+}
+
+function bootstrapForUser(db, user) {
+  const scoped = scopedDbForUser(db, user);
+  scoped.tickets = scoped.tickets.map(slimTicketForBootstrap);
+  scoped.tasks = scoped.tasks.map(slimTaskForBootstrap);
+  scoped.users = scoped.users.map(publicUser);
+  scoped.reports = reports(scoped);
+  scoped.storage = "google-sheets";
+  scoped.stitch = { configured: false, endpoint: "" };
+  return scoped;
+}
+
+function userCanSeeTicket(db, user, ticket) {
+  if (!user || !ticket) return false;
+  if (user.role === "manager") return outletAccessForUser(user, db).indexOf(ticket.outlet) !== -1;
+  if (user.role === "technician") return ticket.assignedTo === user.technicianId || ticket.createdBy === user.id;
+  return true;
+}
+
+function userCanSeeTask(db, user, task) {
+  if (!user || !task) return false;
+  if (user.role === "manager") return outletAccessForUser(user, db).indexOf(task.outlet) !== -1;
+  if (user.role === "technician") return task.assignedTo === user.technicianId;
+  return true;
+}
+
+function ticketPhotos(db, user, id) {
+  const ticket = (db.tickets || []).find((item) => item.id === id);
+  if (!ticket || !userCanSeeTicket(db, user, ticket)) return fail(404, "Ticket not found");
+  return ok({
+    id: ticket.id,
+    photoUrl: ticket.photoUrl || "",
+    photoUrls: (ticket.photoUrls || []).filter(Boolean),
+    evidencePhotoUrl: ticket.evidencePhotoUrl || "",
+    evidencePhotoUrls: (ticket.evidencePhotoUrls || []).filter(Boolean),
+    resolutionPhotoUrls: (ticket.resolutionPhotoUrls || []).filter(Boolean)
+  });
+}
+
+function taskPhotos(db, user, id) {
+  const task = (db.tasks || []).find((item) => item.id === id);
+  if (!task || !userCanSeeTask(db, user, task)) return fail(404, "Task not found");
+  return ok({
+    id: task.id,
+    photoUrl: task.photoUrl || "",
+    photoUrls: (task.photoUrls || []).filter(Boolean),
+    evidencePhotoUrl: task.evidencePhotoUrl || "",
+    evidencePhotoUrls: (task.evidencePhotoUrls || []).filter(Boolean)
+  });
+}
+
 function outletAccessForUser(user, db) {
   if (user.accessAllOutlets) return db.outlets || [];
   if (Array.isArray(user.allowedOutlets) && user.allowedOutlets.length) return user.allowedOutlets;
   return user.outlet ? [user.outlet] : [];
-}
-
-function withReports(db, user) {
-  const next = JSON.parse(JSON.stringify(db));
-  next.users = (next.users || []).map(publicUser);
-  next.reports = reports(next);
-  next.storage = "google-sheets";
-  next.stitch = { configured: false, endpoint: "" };
-  return next;
 }
 
 function reports(db) {
