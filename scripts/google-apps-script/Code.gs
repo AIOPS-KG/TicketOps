@@ -121,8 +121,10 @@ function handleRequest(envelope) {
   if (method === "POST" && /^\/api\/tickets\/[^/]+\/reject$/.test(path)) return requireRole(user, "technician", () => updateTicket(db, segment(path, 2), { status: "New", assignedTo: "", latestDetail: body.reason || "Rejected" }));
   if (method === "DELETE" && /^\/api\/tickets\/[^/]+\/assignment$/.test(path)) return requireAdmin(user, () => updateTicket(db, segment(path, 2), { status: "New", assignedTo: "", scheduledAt: "" }));
   if (method === "DELETE" && /^\/api\/tickets\/[^/]+$/.test(path)) return requireLoggedIn(user, () => deleteById(db, "tickets", segment(path, 2)));
+  if (method === "POST" && path === "/api/admin/photos/migrate") return requireAdmin(user, () => migratePhotosToDrive(db, body));
   if (method === "PATCH" && /^\/api\/tickets\/[^/]+\/status$/.test(path)) return requireLoggedIn(user, () => {
-    var fields = { status: body.status, latestDetail: body.detail || body.status, evidencePhotoUrl: body.evidencePhotoUrl || "", evidencePhotoUrls: body.evidencePhotoUrls || [] };
+    var evidenceUrls = storePhotoList(body.evidencePhotoUrls, "ticket-evidence-" + segment(path, 2));
+    var fields = { status: body.status, latestDetail: body.detail || body.status, evidencePhotoUrl: evidenceUrls[0] || storePhotoValue(body.evidencePhotoUrl, "ticket-evidence-" + segment(path, 2)), evidencePhotoUrls: evidenceUrls };
     if (body.status === "Closed" && Number(body.closePrice || 0) > 0) {
       fields.closePrice = Number(body.closePrice);
       fields.closePriceBy = body.closePriceBy || user.id;
@@ -541,9 +543,117 @@ function scopedDbForUser(db, user) {
   return copy;
 }
 
+// Photos live in Google Drive, not in the sheet DB. Incoming data: URIs are
+// uploaded to the photos folder (anyone-with-link view, matching the app's
+// anonymous-web-app posture) and only a short serving URL is stored. Keeping
+// blobs out of the DB JSON keeps loadDb/saveDb fast for every request.
+const PHOTO_FOLDER_NAME = "TicketOps Photos";
+const PHOTO_FOLDER_PROP = "TICKETOPS_PHOTO_FOLDER_ID";
+const PHOTO_FIELDS = {
+  tickets: [["photoUrl", "photoUrls"], ["evidencePhotoUrl", "evidencePhotoUrls"], ["", "resolutionPhotoUrls"]],
+  tasks: [["photoUrl", "photoUrls"], ["evidencePhotoUrl", ""]]
+};
+
+function photoFolder() {
+  const props = PropertiesService.getScriptProperties();
+  const storedId = props.getProperty(PHOTO_FOLDER_PROP);
+  if (storedId) {
+    try {
+      return DriveApp.getFolderById(storedId);
+    } catch (error) {
+      props.deleteProperty(PHOTO_FOLDER_PROP);
+    }
+  }
+  const folders = DriveApp.getFoldersByName(PHOTO_FOLDER_NAME);
+  const folder = folders.hasNext() ? folders.next() : DriveApp.createFolder(PHOTO_FOLDER_NAME);
+  props.setProperty(PHOTO_FOLDER_PROP, folder.getId());
+  return folder;
+}
+
+function drivePhotoUrl(fileId) {
+  return "https://lh3.googleusercontent.com/d/" + fileId;
+}
+
+function isDataUriPhoto(value) {
+  return String(value || "").indexOf("data:") === 0;
+}
+
+function uploadPhotoToDrive(dataUri, label) {
+  const match = /^data:([^;,]+);base64,(.*)$/.exec(String(dataUri || ""));
+  if (!match) return dataUri;
+  const contentType = match[1] || "image/jpeg";
+  const extension = (contentType.split("/")[1] || "jpg").replace(/[^a-z0-9]/gi, "");
+  const bytes = Utilities.base64Decode(match[2]);
+  const name = "photo-" + (label || "item") + "-" + new Date().getTime() + "-" + Utilities.getUuid().slice(0, 6) + "." + extension;
+  const file = photoFolder().createFile(Utilities.newBlob(bytes, contentType, name));
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  return drivePhotoUrl(file.getId());
+}
+
+function storePhotoValue(value, label) {
+  return isDataUriPhoto(value) ? uploadPhotoToDrive(value, label) : (value || "");
+}
+
+function storePhotoList(list, label) {
+  return (Array.isArray(list) ? list : []).filter(Boolean).map((value) => storePhotoValue(value, label));
+}
+
+// Walks every photo field on an item and moves data: URIs to Drive. Returns the
+// number of photos moved (0 = item already clean).
+function movePhotosToDrive(item, fieldPairs, label) {
+  let moved = 0;
+  fieldPairs.forEach((pair) => {
+    const singleKey = pair[0];
+    const listKey = pair[1];
+    if (singleKey && isDataUriPhoto(item[singleKey])) {
+      item[singleKey] = uploadPhotoToDrive(item[singleKey], label);
+      moved += 1;
+    }
+    if (listKey && Array.isArray(item[listKey]) && item[listKey].some(isDataUriPhoto)) {
+      item[listKey] = item[listKey].filter(Boolean).map((value) => {
+        if (!isDataUriPhoto(value)) return value;
+        moved += 1;
+        return uploadPhotoToDrive(value, label);
+      });
+    }
+  });
+  // Keep single/list variants consistent after migration.
+  if (moved && fieldPairs[0][0] && fieldPairs[0][1] && !item[fieldPairs[0][0]] && Array.isArray(item[fieldPairs[0][1]]) && item[fieldPairs[0][1]].length) {
+    item[fieldPairs[0][0]] = item[fieldPairs[0][1]][0];
+  }
+  return moved;
+}
+
+// POST /api/admin/photos/migrate {limit} — moves embedded photos out of the
+// sheet DB into Drive in bounded batches (Apps Script has a ~6 min execution
+// cap). Call repeatedly until remaining === 0.
+function migratePhotosToDrive(db, body) {
+  const limit = Math.max(1, Math.min(Number((body && body.limit) || 40), 200));
+  let migrated = 0;
+  [["tickets", PHOTO_FIELDS.tickets], ["tasks", PHOTO_FIELDS.tasks]].forEach((entry) => {
+    const key = entry[0];
+    const pairs = entry[1];
+    (db[key] || []).forEach((item) => {
+      if (migrated >= limit) return;
+      migrated += movePhotosToDrive(item, pairs, key.slice(0, -1) + "-" + (item.id || "x"));
+    });
+  });
+  if (migrated > 0) saveDb(db);
+  let remaining = 0;
+  [["tickets", PHOTO_FIELDS.tickets], ["tasks", PHOTO_FIELDS.tasks]].forEach((entry) => {
+    (db[entry[0]] || []).forEach((item) => {
+      entry[1].forEach((pair) => {
+        if (pair[0] && isDataUriPhoto(item[pair[0]])) remaining += 1;
+        if (pair[1] && Array.isArray(item[pair[1]])) remaining += item[pair[1]].filter(isDataUriPhoto).length;
+      });
+    });
+  });
+  return ok({ migrated, remaining, dbBytes: JSON.stringify(db).length });
+}
+
 // Bootstrap ships photo COUNTS instead of base64 blobs; clients fetch full photos
 // on demand via /api/tickets/:id/photos and /api/tasks/:id/photos. Short http(s)
-// URLs stay inline — only heavy data: URIs are stripped.
+// URLs (the Drive links) stay inline — only heavy data: URIs are stripped.
 const PHOTO_INLINE_MAX_CHARS = 512;
 
 function heavyPhotoValue(value) {
@@ -753,8 +863,10 @@ function deleteById(db, key, id) {
 
 function createTicket(db, body, user) {
   if (!body.outlet || !body.category || !body.impact) return fail(400, "outlet, category and impact are required");
+  const ticketId = nextId(db.tickets, "TK-");
+  const photoUrls = storePhotoList(body.photoUrls && body.photoUrls.length ? body.photoUrls : (body.photoUrl ? [body.photoUrl] : []), "ticket-" + ticketId);
   const ticket = {
-    id: nextId(db.tickets, "TK-"),
+    id: ticketId,
     outlet: body.outlet,
     category: body.category,
     assetId: body.assetId || "",
@@ -765,8 +877,8 @@ function createTicket(db, body, user) {
     status: body.assignedTo ? "Assigned" : "New",
     assignedTo: body.assignedTo || "",
     scheduledAt: body.scheduledAt || "",
-    photoUrl: body.photoUrl || "",
-    photoUrls: body.photoUrls || [],
+    photoUrl: photoUrls[0] || "",
+    photoUrls: photoUrls,
     createdBy: user.id,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -811,8 +923,8 @@ function updateTaskStatus(db, id, status, body) {
   if (!task) return fail(404, "Task not found");
   task.status = status;
   task.evidenceComment = body.comment || task.evidenceComment || "";
-  task.photoUrl = body.photoUrl || task.photoUrl || "";
-  task.photoUrls = body.photoUrls || task.photoUrls || [];
+  task.photoUrl = storePhotoValue(body.photoUrl, "task-" + id) || task.photoUrl || "";
+  task.photoUrls = body.photoUrls ? storePhotoList(body.photoUrls, "task-" + id) : (task.photoUrls || []);
   task.completedAt = status === "Done" ? new Date().toISOString() : "";
   saveDb(db);
   return ok({ task, reports: reports(db) });
