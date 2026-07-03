@@ -201,6 +201,19 @@ function snapshotSheet() {
   return sheet;
 }
 
+// Chunk cells are written with a fixed "#" prefix so Sheets can never coerce
+// the value: a raw chunk starting with "'" gets its apostrophe silently
+// stripped, "=" becomes a formula, and TRUE/numeric-looking text gets
+// re-typed — any of which corrupts the reassembled JSON (this bit us on
+// 2026-07-03). The prefix is stripped on read; legacy unprefixed chunks
+// (written before the fix) are read as-is.
+const CHUNK_TEXT_PREFIX = "#";
+
+function decodeChunkCell(value) {
+  const text = String(value == null ? "" : value);
+  return text.indexOf(CHUNK_TEXT_PREFIX) === 0 ? text.slice(CHUNK_TEXT_PREFIX.length) : text;
+}
+
 function loadChunkedDb() {
   const sheet = snapshotSheet();
   const lastRow = sheet.getLastRow();
@@ -209,7 +222,7 @@ function loadChunkedDb() {
     .filter((row) => String(row[1] || "").indexOf("ticketops_db_") === 0)
     .sort((a, b) => Number(a[0]) - Number(b[0]));
   if (!rows.length) return null;
-  const text = rows.map((row) => String(row[2] || "")).join("");
+  const text = rows.map((row) => decodeChunkCell(row[2])).join("");
   if (!text) return null;
   const parsed = parseDbJson(text, "compiled_snapshot");
   return usableDb(parsed) ? normalizeDb(parsed) : null;
@@ -251,7 +264,13 @@ function saveChunkedDb(db) {
   sheet.getRange(1, 1, 1, 4).setValues([["chunk_index", "chunk_key", "json_chunk", "updated_at"]]);
   if (chunks.length) {
     const now = new Date().toISOString();
-    sheet.getRange(2, 1, chunks.length, 4).setValues(chunks.map((chunk, index) => [index, `ticketops_db_${index}`, chunk, now]));
+    const range = sheet.getRange(2, 1, chunks.length, 4);
+    range.setNumberFormat("@");
+    range.setValues(chunks.map((chunk, index) => [index, `ticketops_db_${index}`, CHUNK_TEXT_PREFIX + chunk, now]));
+    // Read-back check: if reassembly doesn't round-trip, fail loudly instead of
+    // leaving a corrupt snapshot behind for the next reader.
+    const readBack = sheet.getRange(2, 3, chunks.length, 1).getValues().map((row) => decodeChunkCell(row[0])).join("");
+    if (readBack !== text) throw new Error("Snapshot write verification failed — chunked data did not round-trip; aborting save.");
   }
 }
 
