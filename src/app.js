@@ -632,6 +632,30 @@ async function taskEvidencePhotoList(task) {
   return [...new Set([bundle.evidencePhotoUrl || bundle.photoUrl, ...(bundle.photoUrls || [])].filter(Boolean))];
 }
 
+// Resolve-by SLA targets per priority, in hours. Purely presentational — the
+// countdown chips are computed client-side from createdAt.
+const SLA_RESOLVE_HOURS = { P1: 4, P2: 24, P3: 72, P4: 168 };
+
+function ticketSlaInfo(ticket) {
+  if (!ticket || ["Closed", "Cancelled"].includes(ticket.status)) return null;
+  const hours = SLA_RESOLVE_HOURS[ticket.priority] || 72;
+  const created = new Date(ticket.createdAt).getTime();
+  if (!Number.isFinite(created)) return null;
+  const msLeft = created + hours * 3600000 - Date.now();
+  const abs = Math.abs(msLeft);
+  const h = Math.floor(abs / 3600000);
+  const span = h >= 48 ? `${Math.round(h / 24)}d` : h > 0 ? `${h}h ${Math.floor((abs % 3600000) / 60000)}m` : `${Math.floor(abs / 60000)}m`;
+  if (msLeft < 0) return { className: "sla-overdue", label: `SLA overdue ${span}` };
+  return { className: msLeft < hours * 3600000 * 0.25 ? "sla-warn" : "sla-ok", label: `SLA ${span} left` };
+}
+
+// Drive-hosted photos (lh3 URLs) support size suffixes — request a small
+// variant for card thumbnails, keep the full image for the lightbox.
+function photoThumbUrl(url, width = 200) {
+  const text = String(url || "");
+  return /^https:\/\/lh3\.googleusercontent\.com\/d\/[^=]+$/.test(text) ? `${text}=w${width}` : text;
+}
+
 async function openLazyPhotoLightbox(title, loadPhotos) {
   const slowTimer = setTimeout(() => showToast("Loading photos from the live backend…", "info", 2500), 400);
   try {
@@ -2409,6 +2433,10 @@ async function handleLogin(event) {
 function showLogin() {
   closeMobileNav();
   setAppLoading(false);
+  const loginUser = document.querySelector("#loginUsername");
+  const loginPass = document.querySelector("#loginPassword");
+  if (loginUser) loginUser.value = "";
+  if (loginPass) loginPass.value = "";
   document.body.classList.remove("has-session");
   document.body.classList.remove("single-role-workspace", "role-admin", "role-manager", "role-technician", "role-auditor");
   delete document.body.dataset.view;
@@ -2595,6 +2623,20 @@ async function loadDirectoryUsers() {
   }
 }
 
+// Same outlet + same category with an open ticket = probably a double report.
+// Warn, but let the user create anyway (two different ACs can genuinely break).
+function findOpenDuplicateTicket(outlet, category) {
+  return (state.tickets || []).find((ticket) =>
+    ticket.outlet === outlet && ticket.category === category && !["Closed", "Cancelled"].includes(ticket.status));
+}
+
+async function confirmDuplicateTicket(duplicate) {
+  return showConfirm(
+    `${duplicate.id} is already open for ${duplicate.category} at ${duplicate.outlet} ("${duplicate.note || "no note"}"). Create another ticket anyway?`,
+    "Create Anyway"
+  );
+}
+
 async function createTicket(event) {
   event.preventDefault();
   if (!canUseView("manager")) return;
@@ -2618,6 +2660,9 @@ async function createTicket(event) {
   if (photoRequired && !photoUrl) {
     throw new Error("Photo is required for critical, food-safety, gas, electrical, leak, or temperature issues.");
   }
+
+    const duplicate = findOpenDuplicateTicket(outlet, category);
+    if (duplicate && !(await confirmDuplicateTicket(duplicate))) return;
 
     const created = await api("/api/tickets", {
       method: "POST",
@@ -2669,6 +2714,10 @@ async function createTechnicianTicket(event) {
     if (ticketRequiresPhoto({ impact, category, note }) && !photoUrls.length) {
       throw new Error("Photo is required for critical, food-safety, gas, electrical, leak, or temperature issues.");
     }
+
+    const techOutlet = document.querySelector("#technicianTicketOutlet").value;
+    const techDuplicate = findOpenDuplicateTicket(techOutlet, category);
+    if (techDuplicate && !(await confirmDuplicateTicket(techDuplicate))) return;
 
     const created = await api("/api/tickets", {
       method: "POST",
@@ -4462,6 +4511,8 @@ function ticketCard(ticket, mode) {
   const issuePhotoCount = ticketIssuePhotoCount(ticket);
   const resolutionPhotoUrls = inlineTicketResolutionPhotos(ticket);
   const resolutionCount = ticketResolutionPhotoCount(ticket);
+  const sla = ticketSlaInfo(ticket);
+  const historyEntries = Array.isArray(ticket.history) ? ticket.history.filter((item) => item && item.action) : [];
   const workflowSteps = ticketWorkflowSteps(ticket);
 
   return `
@@ -4491,6 +4542,7 @@ function ticketCard(ticket, mode) {
         <span class="badge">${escapeHtml(assigned ? assigned.name : "Unassigned")}</span>
         ${ticket.scheduledAt ? `<span class="badge">Dispatch ${escapeHtml(formatDateTime(ticket.scheduledAt))}</span>` : ""}
         ${Number(ticket.closePrice || 0) > 0 ? `<span class="badge status-closed">Close ${escapeHtml(formatClosePrice(ticket.closePrice))}</span>` : ""}
+        ${sla ? `<span class="badge ${sla.className}">${escapeHtml(sla.label)}</span>` : ""}
         ${issuePhotoCount ? `<span class="badge photo-badge">${issuePhotoCount} Photo${issuePhotoCount === 1 ? "" : "s"}</span>` : ""}
         ${resolutionCount ? `<span class="badge status-closed">Completion Photo</span>` : ""}
         ${suggested ? `<span class="badge confidence">Score ${escapeHtml(suggested.dispatchScore || "OK")}: ${escapeHtml(suggested.name)}</span>` : ""}
@@ -4499,15 +4551,25 @@ function ticketCard(ticket, mode) {
       ${nextAction ? `<p class="ticket-meta next-action">Next: ${escapeHtml(nextAction)}</p>` : ""}
       ${issuePhotoCount ? `
         <button class="ticket-photo" type="button" data-photo-open="${escapeHtml(ticket.id)}" aria-label="Open issue photo for ${escapeHtml(ticket.id)}">
-          ${photoUrls.length ? `<img src="${escapeHtml(photoUrls[0])}" alt="Issue photo for ${escapeHtml(ticket.id)}">` : `<span class="ticket-photo-placeholder" aria-hidden="true">📷</span>`}
+          ${photoUrls.length ? `<img src="${escapeHtml(photoThumbUrl(photoUrls[0]))}" alt="Issue photo for ${escapeHtml(ticket.id)}">` : `<span class="ticket-photo-placeholder" aria-hidden="true">📷</span>`}
           <span>${issuePhotoCount} issue photo${issuePhotoCount === 1 ? "" : "s"} attached${photoUrls.length ? "" : " — tap to view"}</span>
         </button>
       ` : ""}
       ${resolutionCount ? `
         <button class="ticket-photo completion-photo" type="button" data-resolution-photo-open="${escapeHtml(ticket.id)}" aria-label="Open completion photo for ${escapeHtml(ticket.id)}">
-          ${resolutionPhotoUrls.length ? `<img src="${escapeHtml(resolutionPhotoUrls[0])}" alt="Completion photo for ${escapeHtml(ticket.id)}">` : `<span class="ticket-photo-placeholder" aria-hidden="true">📷</span>`}
+          ${resolutionPhotoUrls.length ? `<img src="${escapeHtml(photoThumbUrl(resolutionPhotoUrls[0]))}" alt="Completion photo for ${escapeHtml(ticket.id)}">` : `<span class="ticket-photo-placeholder" aria-hidden="true">📷</span>`}
           <span>${resolutionCount} completion photo${resolutionCount === 1 ? "" : "s"} attached${resolutionPhotoUrls.length ? "" : " — tap to view"}</span>
         </button>
+      ` : ""}
+      ${historyEntries.length ? `
+        <details class="ticket-history">
+          <summary>History (${historyEntries.length})</summary>
+          <ul>
+            ${historyEntries.slice().reverse().map((item) => `
+              <li><span class="history-when">${escapeHtml(formatDateTime(item.at))}</span> ${escapeHtml(item.action)} <span class="history-by">· ${escapeHtml(item.by || "")}</span></li>
+            `).join("")}
+          </ul>
+        </details>
       ` : ""}
       ${dispatchReason ? `<p class="ticket-meta dispatch-confidence">Dispatch: ${escapeHtml(dispatchReason)}</p>` : ""}
       ${mode === "admin" && selectedSummary ? `
@@ -5872,7 +5934,20 @@ function renderTechnician() {
     : [];
   const doneTasks = todayTasks.filter((task) => task.status === "Done");
 
+  const canSetOwnAttendance = currentUser?.role === "technician" && currentUser?.technicianId === activeTech?.id;
   dashboard.innerHTML = activeTech ? `
+    ${canSetOwnAttendance ? `
+      <div class="attendance-quick" aria-label="My attendance today">
+        <span class="attendance-quick-label">My Day:</span>
+        ${["Present", "On Leave"].map((status) => `
+          <button type="button" class="small-button attendance-quick-btn ${activeTech.status === status ? "is-current" : ""}"
+            data-attendance-set="${escapeHtml(status)}" ${activeTech.status === status ? "disabled" : ""}>
+            ${status === "Present" ? "✓ Present" : "✈ On Leave"}
+          </button>
+        `).join("")}
+        <span class="attendance-quick-status">Now: ${escapeHtml(activeTech.status || "Unknown")}</span>
+      </div>
+    ` : ""}
     <div class="technician-simple-dashboard">
       ${[
         ["Active", activeTickets.length],
@@ -7255,6 +7330,26 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
+  const attendanceButton = event.target.closest?.("[data-attendance-set]");
+  if (attendanceButton) {
+    const status = attendanceButton.dataset.attendanceSet;
+    const techId = currentUser?.technicianId;
+    if (!techId) return;
+    attendanceButton.disabled = true;
+    try {
+      await api(`/api/technicians/${encodeURIComponent(techId)}/attendance`, {
+        method: "POST",
+        body: JSON.stringify({ status, startsAt: new Date().toISOString() })
+      });
+      showToast(`Attendance set: ${status}.`, "success");
+      await loadState({ silent: true, forceNetwork: true });
+    } catch (error) {
+      attendanceButton.disabled = false;
+      showToast(error.message, "error");
+    }
+    return;
+  }
+
   const photoButton = event.target.closest?.("[data-photo-open]");
   if (photoButton) {
     const ticket = state.tickets.find((item) => item.id === photoButton.dataset.photoOpen);
@@ -7278,7 +7373,7 @@ document.addEventListener("click", async (event) => {
 
   // Tapping anywhere on a ticket card (outside its controls) opens its photos.
   const ticketCardEl = event.target.closest?.(".ticket-card[data-ticket-id]");
-  if (ticketCardEl && !event.target.closest("button, select, input, textarea, label, a")) {
+  if (ticketCardEl && !event.target.closest("button, select, input, textarea, label, a, details, summary")) {
     const ticket = (state.tickets || []).find((item) => item.id === ticketCardEl.dataset.ticketId);
     if (ticketIssuePhotoCount(ticket) + ticketResolutionPhotoCount(ticket) > 0) {
       await openLazyPhotoLightbox(`${ticket.id} — photos`, async () => {

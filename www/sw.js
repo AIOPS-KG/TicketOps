@@ -1,4 +1,4 @@
-const CACHE_NAME = "ticketops-v43-fast-bootstrap";
+const CACHE_NAME = "ticketops-v44-ops-features";
 const APP_SHELL = [
   "./",
   "./index.html",

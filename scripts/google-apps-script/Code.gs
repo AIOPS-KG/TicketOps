@@ -94,7 +94,7 @@ function handleRequest(envelope) {
   if (method === "GET" && path === "/api/stitch/status") return requireAdmin(user, () => ok({ configured: false, connected: false, endpoint: "", tools: [], error: "Stitch is not configured in the Google Sheets backend" }));
   if (method === "POST" && path === "/api/stitch/call") return requireAdmin(user, () => fail(503, "Stitch is not configured in the Google Sheets backend"));
   if (method === "POST" && path === "/api/auth/login") return login(db, body);
-  if (method === "GET" && path === "/api/auth/demo-users") return ok({ users: (db.users || []).map(publicUser) });
+  if (method === "GET" && path === "/api/auth/demo-users") return requireLoggedIn(user, () => ok({ users: (db.users || []).map(publicUser) }));
   if (method === "POST" && path === "/api/auth/change-password") return changePassword(db, user, body);
   if (method === "POST" && /^\/api\/admin\/users\/[^/]+\/reset-password$/.test(path)) return resetPassword(db, user, segment(path, 3), body);
   if (method === "GET" && path === "/api/bootstrap") return requireLogin(user, () => { if (!db.__readOnlyFallback) refreshTodayTasks(db); return ok(bootstrapForUser(db, user)); });
@@ -108,6 +108,9 @@ function handleRequest(envelope) {
   if (method === "GET" && path.startsWith("/api/reports/export/")) return requireAdmin(user, () => ok(exportCsv(db, segment(path, 3))));
   if (method === "GET" && path.startsWith("/api/backups/monthly/")) return requireAdmin(user, () => monthlyBackup(db, decodeURIComponent(segment(path, 3))));
   if (method === "POST" && path === "/api/backups/report") return requireAdmin(user, () => ok(backupReport(body)));
+  if (method === "GET" && path === "/api/admin/digest/preview") return requireAdmin(user, () => ok(buildDailyDigest(db)));
+  if (method === "POST" && path === "/api/admin/digest/run") return requireAdmin(user, () => ok(sendDailyDigest()));
+  if (method === "POST" && path === "/api/admin/digest/install") return requireAdmin(user, () => ok(installDailyDigestTrigger(body)));
   if (method === "GET" && path === "/api/technician/dashboard") return requireRole(user, "technician", () => ok(technicianDashboard(db, user.technicianId)));
   if (method === "GET" && path === "/api/technician/tasks/today") return requireRole(user, "technician", () => ok(todayTasksForTechnician(db, user.technicianId)));
   if (method === "POST" && /^\/api\/technician\/tasks\/[^/]+\/status$/.test(path)) return requireRole(user, "technician", () => updateTaskStatus(db, segment(path, 3), body.status === "done" ? "Done" : "Not Done", body));
@@ -115,11 +118,11 @@ function handleRequest(envelope) {
   if (method === "DELETE" && /^\/api\/tasks\/[^/]+$/.test(path)) return requireAdmin(user, () => deleteById(db, "tasks", segment(path, 2)));
   if (method === "POST" && path === "/api/tasks/refresh") return requireAdmin(user, () => { var n = refreshTodayTasks(db); return ok({ generated: n, date: dateKey() }); });
   if (method === "POST" && path === "/api/tickets") return requireLoggedIn(user, () => createTicket(db, body, user));
-  if (method === "PATCH" && /^\/api\/tickets\/[^/]+\/assign$/.test(path)) return requireAdmin(user, () => assignTicket(db, segment(path, 2), body));
-  if (method === "PATCH" && /^\/api\/tickets\/[^/]+\/schedule$/.test(path)) return requireAdmin(user, () => updateTicket(db, segment(path, 2), { scheduledAt: body.scheduledAt || "" }));
-  if (method === "POST" && /^\/api\/tickets\/[^/]+\/accept$/.test(path)) return requireRole(user, "technician", () => updateTicket(db, segment(path, 2), { status: "Acknowledged", latestDetail: "Accepted by technician" }));
-  if (method === "POST" && /^\/api\/tickets\/[^/]+\/reject$/.test(path)) return requireRole(user, "technician", () => updateTicket(db, segment(path, 2), { status: "New", assignedTo: "", latestDetail: body.reason || "Rejected" }));
-  if (method === "DELETE" && /^\/api\/tickets\/[^/]+\/assignment$/.test(path)) return requireAdmin(user, () => updateTicket(db, segment(path, 2), { status: "New", assignedTo: "", scheduledAt: "" }));
+  if (method === "PATCH" && /^\/api\/tickets\/[^/]+\/assign$/.test(path)) return requireAdmin(user, () => assignTicket(db, segment(path, 2), body, user));
+  if (method === "PATCH" && /^\/api\/tickets\/[^/]+\/schedule$/.test(path)) return requireAdmin(user, () => updateTicket(db, segment(path, 2), { scheduledAt: body.scheduledAt || "" }, user, body.scheduledAt ? "Scheduled for " + body.scheduledAt : "Schedule cleared"));
+  if (method === "POST" && /^\/api\/tickets\/[^/]+\/accept$/.test(path)) return requireRole(user, "technician", () => updateTicket(db, segment(path, 2), { status: "Acknowledged", latestDetail: "Accepted by technician" }, user, "Accepted by technician"));
+  if (method === "POST" && /^\/api\/tickets\/[^/]+\/reject$/.test(path)) return requireRole(user, "technician", () => updateTicket(db, segment(path, 2), { status: "New", assignedTo: "", latestDetail: body.reason || "Rejected" }, user, "Rejected" + (body.reason ? ": " + body.reason : "")));
+  if (method === "DELETE" && /^\/api\/tickets\/[^/]+\/assignment$/.test(path)) return requireAdmin(user, () => updateTicket(db, segment(path, 2), { status: "New", assignedTo: "", scheduledAt: "" }, user, "Assignment removed"));
   if (method === "DELETE" && /^\/api\/tickets\/[^/]+$/.test(path)) return requireLoggedIn(user, () => deleteById(db, "tickets", segment(path, 2)));
   if (method === "POST" && path === "/api/admin/photos/migrate") return requireAdmin(user, () => migratePhotosToDrive(db, body));
   if (method === "PATCH" && /^\/api\/tickets\/[^/]+\/status$/.test(path)) return requireLoggedIn(user, () => {
@@ -130,7 +133,8 @@ function handleRequest(envelope) {
       fields.closePriceBy = body.closePriceBy || user.id;
       fields.closePriceAt = body.closePriceAt || new Date().toISOString();
     }
-    return updateTicket(db, segment(path, 2), fields);
+    var statusAction = "Status → " + body.status + (body.detail && body.detail !== body.status ? " — " + body.detail : "");
+    return updateTicket(db, segment(path, 2), fields, user, statusAction);
   });
   if (method === "PATCH" && /^\/api\/technicians\/[^/]+\/status$/.test(path)) return requireAdmin(user, () => updateTechnician(db, segment(path, 2), { status: body.status }));
   if (method === "POST" && /^\/api\/technicians\/[^/]+\/attendance$/.test(path)) return requireLoggedIn(user, () => createAttendancePlan(db, segment(path, 2), body, user));
@@ -492,13 +496,25 @@ function defaultViewForRole(role) {
   return "dashboard";
 }
 
+// Brute-force guard: 5 failed attempts per username locks login for 10 minutes.
+// CacheService needs no extra OAuth scope and expires entries on its own.
+const LOGIN_FAIL_LIMIT = 5;
+const LOGIN_FAIL_WINDOW_SECONDS = 600;
+
 function login(db, body) {
   const username = String(body.username || "").trim().toLowerCase();
   const password = String(body.password || "");
+  const cache = CacheService.getScriptCache();
+  const failKey = "login-fail:" + username;
+  const fails = Number(cache.get(failKey) || 0);
+  if (fails >= LOGIN_FAIL_LIMIT) return fail(429, "Too many failed attempts. Try again in a few minutes.");
   const user = (db.users || []).find((item) => String(item.username || "").toLowerCase() === username);
-  if (!user) return fail(401, "Invalid username or password");
-  const accepted = password === String(user.password || "") || password === String(user.passwordPlain || "") || password === DEFAULT_PASSWORDS[username];
-  if (!accepted) return fail(401, "Invalid username or password");
+  const accepted = Boolean(user) && (password === String(user.password || "") || password === String(user.passwordPlain || "") || password === DEFAULT_PASSWORDS[username]);
+  if (!accepted) {
+    cache.put(failKey, String(fails + 1), LOGIN_FAIL_WINDOW_SECONDS);
+    return fail(401, "Invalid username or password");
+  }
+  cache.remove(failKey);
   return ok({ user: publicUser(user) });
 }
 
@@ -901,8 +917,10 @@ function createTicket(db, body, user) {
     createdBy: user.id,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    latestDetail: body.note || "Created"
+    latestDetail: body.note || "Created",
+    history: []
   };
+  appendTicketHistory(ticket, "Created" + (body.assignedTo ? " (pre-assigned)" : ""), user);
   db.tickets.unshift(ticket);
   saveDb(db);
   return { ok: true, status: 201, body: ticket };
@@ -915,18 +933,35 @@ function priorityForImpact(impact) {
   return "P3";
 }
 
-function updateTicket(db, id, fields) {
+// Append-only per-ticket audit trail. Capped so a long-lived ticket cannot
+// bloat the snapshot.
+const TICKET_HISTORY_MAX = 50;
+
+function appendTicketHistory(ticket, action, actor) {
+  if (!Array.isArray(ticket.history)) ticket.history = [];
+  ticket.history.push({
+    at: new Date().toISOString(),
+    action: String(action || "Updated"),
+    by: (actor && (actor.name || actor.username || actor.id)) || "system"
+  });
+  if (ticket.history.length > TICKET_HISTORY_MAX) ticket.history = ticket.history.slice(-TICKET_HISTORY_MAX);
+}
+
+function updateTicket(db, id, fields, actor, action) {
   const ticket = db.tickets.find((item) => item.id === id);
   if (!ticket) return fail(404, "Ticket not found");
   Object.keys(fields || {}).forEach((key) => { ticket[key] = fields[key]; });
   ticket.updatedAt = new Date().toISOString();
+  appendTicketHistory(ticket, action || (fields && fields.status ? "Status → " + fields.status : "Updated"), actor);
   saveDb(db);
   return ok({ ticket, reports: reports(db) });
 }
 
-function assignTicket(db, id, body) {
+function assignTicket(db, id, body, actor) {
   const techId = body.technicianId || body.assignedTo || "";
-  return updateTicket(db, id, { assignedTo: techId, scheduledAt: body.scheduledAt || "", status: techId ? "Assigned" : "New", latestDetail: "Assigned" });
+  const tech = techId ? (db.technicians || []).find((item) => item.id === techId) : null;
+  const action = techId ? "Assigned to " + ((tech && tech.name) || techId) : "Unassigned";
+  return updateTicket(db, id, { assignedTo: techId, scheduledAt: body.scheduledAt || "", status: techId ? "Assigned" : "New", latestDetail: "Assigned" }, actor, action);
 }
 
 function updateTechnician(db, id, fields) {
@@ -1177,6 +1212,77 @@ function installDriveBackupTriggers() {
     firstBackup,
     status
   };
+}
+
+// ---- Daily digest (8am email to admins) ----------------------------------
+// Recipients live in the TICKETOPS_DIGEST_RECIPIENTS script property
+// (comma-separated), set via POST /api/admin/digest/install {recipients}.
+const DIGEST_RECIPIENTS_PROP = "TICKETOPS_DIGEST_RECIPIENTS";
+
+function digestRecipients() {
+  const stored = PropertiesService.getScriptProperties().getProperty(DIGEST_RECIPIENTS_PROP) || "";
+  return stored.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function buildDailyDigest(db) {
+  const now = new Date();
+  const today = dateKey();
+  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const month = today.slice(0, 7);
+  const tickets = db.tickets || [];
+  const tasks = db.tasks || [];
+  const isOpen = (ticket) => ["Closed", "Cancelled"].indexOf(ticket.status) === -1;
+  const openP1 = tickets.filter((ticket) => isOpen(ticket) && ticket.priority === "P1")
+    .map((ticket) => ({ id: ticket.id, outlet: ticket.outlet, note: ticket.note || "", ageHours: Math.round((now.getTime() - new Date(ticket.createdAt).getTime()) / 3600000) }));
+  const todayTasks = tasks.filter((task) => task.date === today);
+  const doneToday = todayTasks.filter((task) => task.status === "Done").length;
+  return {
+    date: today,
+    open: tickets.filter(isOpen).length,
+    openP1,
+    createdYesterday: tickets.filter((ticket) => String(ticket.createdAt || "").slice(0, 10) === yesterday).length,
+    closedYesterday: tickets.filter((ticket) => ticket.status === "Closed" && String(ticket.updatedAt || "").slice(0, 10) === yesterday).length,
+    checklistToday: { done: doneToday, total: todayTasks.length, rate: todayTasks.length ? Math.round((doneToday / todayTasks.length) * 100) : 0 },
+    monthClosePriceTotal: tickets.filter((ticket) => ticket.status === "Closed" && String(ticket.closePriceAt || ticket.updatedAt || "").slice(0, 7) === month)
+      .reduce((sum, ticket) => sum + Number(ticket.closePrice || 0), 0),
+    recipients: digestRecipients()
+  };
+}
+
+function digestHtml(digest) {
+  const p1Rows = digest.openP1.length
+    ? digest.openP1.map((t) => "<li><b>" + t.id + "</b> — " + t.outlet + " — " + t.note + " (" + t.ageHours + "h old)</li>").join("")
+    : "<li>None 🎉</li>";
+  return "<h2>TicketOps — " + digest.date + "</h2>" +
+    "<p><b>" + digest.open + "</b> tickets open · <b>" + digest.createdYesterday + "</b> new yesterday · <b>" + digest.closedYesterday + "</b> closed yesterday</p>" +
+    "<p>Today's checklist: <b>" + digest.checklistToday.done + "/" + digest.checklistToday.total + "</b> (" + digest.checklistToday.rate + "%)</p>" +
+    "<p>Month repair spend: <b>Rs. " + digest.monthClosePriceTotal + "</b></p>" +
+    "<h3>Open P1 (critical)</h3><ul>" + p1Rows + "</ul>" +
+    "<p><a href=\"https://ticketops-silk.vercel.app\">Open TicketOps</a></p>";
+}
+
+function sendDailyDigest() {
+  const recipients = digestRecipients();
+  if (!recipients.length) throw new Error("No digest recipients configured. POST /api/admin/digest/install with {recipients:\"a@b.com,c@d.com\"} first.");
+  const digest = buildDailyDigest(loadDb());
+  MailApp.sendEmail({
+    to: recipients.join(","),
+    subject: "TicketOps daily digest — " + digest.date + " (" + digest.open + " open, " + digest.openP1.length + " P1)",
+    htmlBody: digestHtml(digest)
+  });
+  return { ok: true, sentTo: recipients, date: digest.date };
+}
+
+function installDailyDigestTrigger(body) {
+  if (body && body.recipients) {
+    PropertiesService.getScriptProperties().setProperty(DIGEST_RECIPIENTS_PROP, String(body.recipients));
+  }
+  if (!digestRecipients().length) throw new Error("Pass {recipients:\"a@b.com\"} — no recipients configured.");
+  ScriptApp.getProjectTriggers().forEach((trigger) => {
+    if (trigger.getHandlerFunction() === "sendDailyDigest") ScriptApp.deleteTrigger(trigger);
+  });
+  ScriptApp.newTrigger("sendDailyDigest").timeBased().everyDays(1).atHour(8).nearMinute(0).create();
+  return { ok: true, recipients: digestRecipients(), schedule: "daily 08:00 " + Session.getScriptTimeZone() };
 }
 
 function backupReport(backup) {

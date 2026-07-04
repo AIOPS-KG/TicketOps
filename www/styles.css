@@ -1258,6 +1258,25 @@ body[data-dashboard-mode="detail"] #dashboardSummaryGrid { display: none; }
 .ticket-photo span { font-size: 12px; color: var(--ink-soft); }
 .ticket-photo.completion-photo { border-color: color-mix(in srgb, var(--success) 35%, transparent); }
 
+/* SLA countdown chips */
+.badge.sla-ok { background: color-mix(in srgb, var(--success) 12%, transparent); color: var(--success); border: 1px solid color-mix(in srgb, var(--success) 30%, transparent); }
+.badge.sla-warn { background: color-mix(in srgb, #d97706 14%, transparent); color: #b45309; border: 1px solid color-mix(in srgb, #d97706 35%, transparent); }
+.badge.sla-overdue { background: color-mix(in srgb, #dc2626 14%, transparent); color: #dc2626; border: 1px solid color-mix(in srgb, #dc2626 40%, transparent); font-weight: 700; }
+
+/* Ticket history thread */
+.ticket-history { border-top: 1px dashed var(--panel-border); padding-top: 6px; }
+.ticket-history summary { font-size: 12px; color: var(--ink-soft); cursor: pointer; user-select: none; }
+.ticket-history ul { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.ticket-history li { font-size: 12px; color: var(--ink-soft); line-height: 1.4; }
+.ticket-history .history-when { color: var(--ink); font-weight: 600; margin-right: 4px; }
+.ticket-history .history-by { opacity: 0.75; }
+
+/* Technician one-tap attendance */
+.attendance-quick { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px; margin-bottom: 10px; border: 1px solid var(--panel-border); border-radius: var(--radius-sm); background: var(--panel-2); }
+.attendance-quick-label { font-size: 12px; font-weight: 700; color: var(--ink); }
+.attendance-quick-btn.is-current { opacity: 0.55; }
+.attendance-quick-status { font-size: 12px; color: var(--ink-soft); margin-left: auto; }
+
 /* Assignment signal */
 .assignment-signal { display: flex; flex-wrap: wrap; gap: 8px; }
 .assignment-signal span { font-size: 11.5px; color: var(--ink-soft); background: var(--panel-2); border: 1px solid var(--panel-border); padding: 4px 9px; border-radius: var(--radius-pill); }
