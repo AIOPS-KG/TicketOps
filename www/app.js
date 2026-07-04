@@ -1576,6 +1576,7 @@ function userOutletLabel(user) {
 
 function invalidateCachesAfterWrite(options = {}) {
   if (String(options.method || "GET").toUpperCase() === "GET") return;
+  if (options.idempotent) return; // login and friends read state, never change it
   localStorage.removeItem(bootstrapCacheKey());
   photoBundleCache.clear();
 }
@@ -2220,7 +2221,10 @@ async function appsScriptApi(path, options = {}) {
     body: options.body ? JSON.parse(options.body) : null
   });
 
-  const isRead = method === "GET";
+  // options.idempotent marks the few POSTs that are safe to retry (login —
+  // it never mutates data), so they get the same transient-failure retries
+  // as reads instead of dying on the first Apps Script redirect race.
+  const isRead = method === "GET" || options.idempotent === true;
   const maxAttempts = isRead ? 4 : 1;
   const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 25000;
   let lastError = null;
@@ -2366,11 +2370,83 @@ async function fetchBootstrapState({ preferCache = true } = {}) {
   return nextState;
 }
 
+// Cache-first login, mirroring the bootstrap SWR: after one successful sign-in
+// on this device, the same credentials enter the app instantly (a salted
+// SHA-256 fingerprint is compared locally) while the real login re-verifies in
+// the background — if the password changed server-side, the session is ended
+// with a toast. Consistent with the app's current header-based auth posture.
+const LOGIN_CACHE_KEY = "ticketops-login-cache-v1";
+const LOGIN_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+async function credentialFingerprint(username, password) {
+  try {
+    if (!crypto?.subtle) return null;
+    const data = new TextEncoder().encode(`ticketops-login-v1|${username}|${password}`);
+    const digest = await crypto.subtle.digest("SHA-256", data);
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  } catch {
+    return null;
+  }
+}
+
+function readLoginCache() {
+  try {
+    return JSON.parse(localStorage.getItem(LOGIN_CACHE_KEY) || "null");
+  } catch {
+    return null;
+  }
+}
+
+function writeLoginCache(username, fingerprint, user) {
+  if (!fingerprint) return;
+  try {
+    localStorage.setItem(LOGIN_CACHE_KEY, JSON.stringify({ username, fingerprint, user, at: Date.now() }));
+  } catch {
+    // Storage pressure — slow path still works.
+  }
+}
+
+function clearLoginCache() {
+  localStorage.removeItem(LOGIN_CACHE_KEY);
+}
+
+function verifyLoginInBackground(username, password, fingerprint) {
+  api("/api/auth/login", {
+    method: "POST",
+    idempotent: true,
+    body: JSON.stringify({ username, password })
+  }).then((result) => {
+    writeLoginCache(String(username).trim().toLowerCase(), fingerprint, result.user);
+    saveUser(result.user); // pick up any role/permission changes
+  }).catch((error) => {
+    if (/invalid username or password|too many failed/i.test(String(error.message))) {
+      clearLoginCache();
+      clearUser();
+      showLogin();
+      document.querySelector("#loginError").textContent = "Your password changed — please sign in again.";
+    }
+    // Network/backend hiccups: keep the cached session; bootstrap SWR already
+    // tolerates a slow backend.
+  });
+}
+
 async function loginWithCredentials(username, password) {
+  const uname = String(username || "").trim().toLowerCase();
+  const fingerprint = await credentialFingerprint(uname, password);
+  const cached = readLoginCache();
+  if (fingerprint && cached?.user && cached.username === uname && cached.fingerprint === fingerprint
+    && Date.now() - Number(cached.at || 0) < LOGIN_CACHE_MAX_AGE_MS) {
+    saveUser(cached.user);
+    verifyLoginInBackground(username, password, fingerprint);
+    await enterApp();
+    return;
+  }
   const result = await api("/api/auth/login", {
     method: "POST",
+    idempotent: true,
     body: JSON.stringify({ username, password })
   });
+  writeLoginCache(uname, fingerprint, result.user);
   saveUser(result.user);
   await enterApp();
 }
@@ -2430,9 +2506,19 @@ async function handleLogin(event) {
   }
 }
 
+// Apps Script cold starts cost 10-20s. Poke the backend the moment the login
+// screen appears so it's warm by the time the user finishes typing.
+let backendWarmed = false;
+function warmBackend() {
+  if (backendWarmed || !USE_APPS_SCRIPT_API || !API_BASE) return;
+  backendWarmed = true;
+  fetch(API_BASE, { method: "GET", redirect: "follow" }).catch(() => { backendWarmed = false; });
+}
+
 function showLogin() {
   closeMobileNav();
   setAppLoading(false);
+  warmBackend();
   const loginUser = document.querySelector("#loginUsername");
   const loginPass = document.querySelector("#loginPassword");
   if (loginUser) loginUser.value = "";
@@ -7647,6 +7733,7 @@ document.addEventListener("submit", async (event) => {
       body: JSON.stringify({ currentPassword, newPassword, confirmPassword })
     });
 
+    clearLoginCache();
     clearUser();
     showLogin();
     document.querySelector("#loginError").textContent = "Password updated. Please sign in again.";
