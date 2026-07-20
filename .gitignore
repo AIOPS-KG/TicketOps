@@ -13,3 +13,4 @@ mobile_flutter/build/
 mobile_flutter/.flutter-plugins
 mobile_flutter/.flutter-plugins-dependencies
 .DS_Store
+backups/*.dump
