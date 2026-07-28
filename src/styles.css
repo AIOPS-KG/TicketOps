@@ -530,7 +530,7 @@ label.checkline {
   background: var(--panel);
   box-shadow: var(--shadow-lg);
 }
-.app-loading-logo { width: 54px; height: 54px; border-radius: 13px; }
+.app-loading-logo { width: 54px; height: 54px; object-fit: contain; filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.18)); }
 .app-loading-copy { display: flex; flex-direction: column; gap: 5px; }
 .app-loading-copy span { font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--accent); font-weight: 700; }
 .app-loading-copy strong { font-family: var(--font-head); font-size: 19px; }
@@ -581,7 +581,7 @@ label.checkline {
     radial-gradient(600px 300px at 0% 0%, rgba(255, 255, 255, 0.06), transparent),
     var(--side-bg);
 }
-.login-logo-mark { width: 50px; height: 50px; border-radius: 13px; }
+.login-logo-mark { width: 64px; height: 64px; object-fit: contain; filter: drop-shadow(0 3px 8px rgba(0, 0, 0, 0.32)); }
 .login-brand-heading { font-family: var(--font-head); color: #fff; font-size: clamp(30px, 5vw, 42px); }
 .login-brand-sub { color: rgba(255, 255, 255, 0.72); font-size: 14.5px; max-width: 38ch; }
 .login-feature-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 11px; }
@@ -629,16 +629,8 @@ label.checkline {
 body.ops-portal:not(.has-session) .topbar { display: none; }
 body.ops-portal:not(.has-session) .nav-backdrop { display: none; }
 
-.brand-lockup { display: flex; align-items: center; gap: 10px; }
-.brand-mark { width: 28px; height: 28px; min-width: 28px; border-radius: 7px; }
-.topbar h1 {
-  font-family: var(--font-body);
-  font-size: 13px;
-  font-weight: 800;
-  color: #fff;
-  letter-spacing: 0;
-  white-space: nowrap;
-}
+.brand-lockup { display: flex; align-items: center; justify-content: center; }
+.brand-mark { width: 34px; height: 34px; min-width: 34px; object-fit: contain; }
 
 .tabs { display: flex; }
 .nav-section-label {
