@@ -581,8 +581,15 @@ label.checkline {
     radial-gradient(600px 300px at 0% 0%, rgba(255, 255, 255, 0.06), transparent),
     var(--side-bg);
 }
-.login-logo-mark { width: clamp(84px, 11vw, 128px); height: clamp(84px, 11vw, 128px); object-fit: contain; filter: drop-shadow(0 3px 8px rgba(0, 0, 0, 0.32)); }
-.login-brand-heading { font-family: var(--font-head); color: #fff; font-size: clamp(30px, 5vw, 42px); }
+.login-logo-plate {
+  align-self: flex-start;
+  display: inline-flex;
+  padding: 14px 20px;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.25);
+}
+.login-logo-mark { display: block; width: clamp(170px, 22vw, 230px); height: auto; }
 .login-brand-sub { color: rgba(255, 255, 255, 0.72); font-size: 14.5px; max-width: 38ch; }
 .login-feature-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 11px; }
 .login-feature-list li {
