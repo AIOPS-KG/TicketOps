@@ -5045,6 +5045,8 @@ function openKpiDrill(title, tickets, tasks) {
               <div class="ticket-meta">
                 <span>${tech ? escapeHtml(tech.name) : "Unassigned"}</span>
                 <span>${age}</span>
+                ${Number(ticket.closePrice || 0) > 0 ? `<span class="kpi-drill-price">${escapeHtml(formatClosePrice(ticket.closePrice))}</span>` : ""}
+                ${(currentUser?.role === "admin" && Number(ticket.closePrice || 0) > 0) ? `<button type="button" class="small-button kpi-drill-edit-price" data-edit-close-price="${escapeHtml(ticket.id)}">Edit</button>` : ""}
               </div>
             </article>
           `;
