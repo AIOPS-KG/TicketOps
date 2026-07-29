@@ -4614,7 +4614,7 @@ function ticketCard(ticket, mode) {
   const asset = (state.assets || []).find((item) => item.id === ticket.assetId);
   const category = ticketCategoryLabel(ticket);
   const suggested = !assigned && ticket.status !== "Closed" ? ticket.suggestedTechnician : null;
-  const selectedTech = assigned || suggested;
+  const selectedTech = assigned || (suggested ? technicianById(suggested.id) : null);
   const selectedSummary = selectedTech ? technicianAssignmentSummary(selectedTech, ticket) : null;
   const canVerify = ticket.status === "Resolved" || ticket.status === "Verification Pending";
   const canWork = ["Assigned", "Acknowledged", "In Progress", "Blocked"].includes(ticket.status);

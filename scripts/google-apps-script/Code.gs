@@ -336,6 +336,44 @@ function technicianCoversOutlet(tech, outlet) {
   return !outlets.length || outlets.indexOf(outlet) !== -1;
 }
 
+// Ticket dispatch load-balancing: mirrors balancedChecklistTechnician's approach
+// (used for maintenance checklists) but weighted by each technician's current
+// OPEN ticket count instead of task count, so busy technicians aren't piled on.
+var TICKET_DISPATCH_AVAILABLE_STATUSES = ["Present", "Busy", "Emergency Available"];
+
+function technicianOpenTicketLoad(db) {
+  var map = {};
+  (db.tickets || []).forEach(function(ticket) {
+    if (ticket.assignedTo && ticket.status !== "Closed") {
+      map[ticket.assignedTo] = (map[ticket.assignedTo] || 0) + 1;
+    }
+  });
+  return map;
+}
+
+function suggestedTechnicianForTicket(db, ticket) {
+  var technicians = db.technicians || [];
+  var covering = technicians.filter(function(t) { return technicianCoversOutlet(t, ticket.outlet); });
+  if (!covering.length) return null;
+  var available = covering.filter(function(t) { return TICKET_DISPATCH_AVAILABLE_STATUSES.indexOf(t.status) !== -1; });
+  var pool = available.length ? available : covering;
+  var loadMap = technicianOpenTicketLoad(db);
+  var pick = balancedChecklistTechnician(pool, loadMap);
+  if (!pick) return null;
+  var load = loadMap[pick.id] || 0;
+  return {
+    id: pick.id,
+    name: pick.name,
+    dispatchReason: "Lowest current load (" + load + " open ticket" + (load === 1 ? "" : "s") + ") among technicians covering " + ticket.outlet
+  };
+}
+
+function withSuggestedTechnician(db, ticket) {
+  if (ticket.assignedTo || ticket.status === "Closed") return ticket;
+  var suggestion = suggestedTechnicianForTicket(db, ticket);
+  return suggestion ? Object.assign({}, ticket, { suggestedTechnician: suggestion }) : ticket;
+}
+
 function maintenanceRuleById(db, ruleId) {
   return (db.maintenanceRules || []).find(function(r) { return r.id === ruleId; }) || null;
 }
@@ -741,7 +779,7 @@ function slimTaskForBootstrap(task) {
 
 function bootstrapForUser(db, user) {
   const scoped = scopedDbForUser(db, user);
-  scoped.tickets = scoped.tickets.map(slimTicketForBootstrap);
+  scoped.tickets = scoped.tickets.map((ticket) => withSuggestedTechnician(db, ticket)).map(slimTicketForBootstrap);
   scoped.tasks = scoped.tasks.map(slimTaskForBootstrap);
   scoped.users = scoped.users.map(publicUser);
   scoped.reports = reports(scoped);
@@ -923,7 +961,7 @@ function createTicket(db, body, user) {
   appendTicketHistory(ticket, "Created" + (body.assignedTo ? " (pre-assigned)" : ""), user);
   db.tickets.unshift(ticket);
   saveDb(db);
-  return { ok: true, status: 201, body: ticket };
+  return { ok: true, status: 201, body: withSuggestedTechnician(db, ticket) };
 }
 
 function priorityForImpact(impact) {
