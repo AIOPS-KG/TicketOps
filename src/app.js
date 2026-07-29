@@ -1282,11 +1282,44 @@ function scheduledTaskRows(tasks, { allowActions = false } = {}) {
   }).join("") : `<div class="empty">No scheduled jobs for today.</div>`;
 }
 
-function chooseEvidencePhoto() {
+function choosePhotoSource() {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="modal-dialog">
+        <p class="modal-message">Add a photo</p>
+        <div class="modal-actions photo-source-actions">
+          <button type="button" class="primary-button" data-source="camera">Camera</button>
+          <button type="button" class="primary-button" data-source="gallery">Gallery</button>
+          <button type="button" class="small-button" data-source="cancel">Cancel</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const cleanup = (result) => {
+      overlay.remove();
+      document.removeEventListener("keydown", onKey);
+      resolve(result);
+    };
+    const onKey = (e) => { if (e.key === "Escape") cleanup(null); };
+    overlay.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-source]");
+      if (!btn) { if (e.target === overlay) cleanup(null); return; }
+      cleanup(btn.dataset.source === "cancel" ? null : btn.dataset.source);
+    });
+    document.addEventListener("keydown", onKey);
+  });
+}
+
+async function chooseEvidencePhoto() {
+  const source = await choosePhotoSource();
+  if (!source) return "";
+
   const input = document.createElement("input");
   input.type = "file";
   input.accept = "image/*";
-  input.capture = "environment";
+  if (source === "camera") input.setAttribute("capture", "environment");
   input.style.position = "fixed";
   input.style.left = "-9999px";
   input.style.top = "0";
