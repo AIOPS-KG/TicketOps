@@ -637,7 +637,17 @@ body.ops-portal:not(.has-session) .topbar { display: none; }
 body.ops-portal:not(.has-session) .nav-backdrop { display: none; }
 
 .brand-lockup { display: flex; align-items: center; justify-content: center; }
-.brand-mark { width: 34px; height: 34px; min-width: 34px; object-fit: contain; }
+.brand-mark-plate {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.25);
+  max-width: 100%;
+}
+.brand-mark { display: block; width: 148px; max-width: 100%; height: auto; }
 
 .tabs { display: flex; }
 .nav-section-label {
